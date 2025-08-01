@@ -1,101 +1,198 @@
-# auth.py
+# News.py
 import streamlit as st
-import sqlite3
-import hashlib
-import re
+import requests
+import xmltodict
+import time
+from datetime import datetime
+from auth_new import show_auth_page, logout
 
-# Database setup
-def create_connection():
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (email TEXT PRIMARY KEY, password TEXT, name TEXT)''')
-    conn.commit()
-    return conn
+# Check authentication
+if "authenticated" not in st.session_state or not st.session_state.authenticated:
+    show_auth_page()
+    st.stop()
 
-# Password hashing
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
+# Page configuration
+st.set_page_config(page_title="🗞️ News Results", layout="wide")
 
-# Email validation
-def is_valid_email(email):
-    pattern = r'^[\w\.-]+@[\w\.-]+\.\w+$'
-    return re.match(pattern, email)
+# Source and category mappings
+sources = {
+    "Times of India": "https://timesofindia.indiatimes.com/rssfeedstopstories.cms",
+    "The Hindu": "https://www.thehindu.com/news/national/feeder/default.rss",
+    "Dainik Bhaskar": "https://www.bhaskar.com/rss-v1--category-1061.xml",
+    "ABP Majha": "https://marathi.abplive.com/rss/featured-articles.xml",
+    "Dainik Jagran": "https://www.jagran.com/rss/news/national.xml",
+    "Aaj Tak": "https://www.aajtak.in/rss",
+    "India Today": "https://www.indiatoday.in/rss/home"
+}
 
-# Sign up function
-def sign_up():
-    st.subheader("Create New Account")
-    name = st.text_input("Full Name")
-    email = st.text_input("Email")
-    password = st.text_input("Password", type='password')
-    confirm_password = st.text_input("Confirm Password", type='password')
+categories = {
+    "General": [{"name": "Times of India", "url": sources["Times of India"]}],
+    "Sports": [{"name": "TOI Sports", "url": "https://timesofindia.indiatimes.com/rssfeeds/4719148.cms"}],
+    "Politics": [{"name": "The Hindu Politics", "url": sources["The Hindu"]}],
+    "Technology": [{"name": "India Today Tech", "url": "https://www.indiatoday.in/technology/rss"}],
+    "Market": [{"name": "Economic Times Market", "url": "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"}],
+    "Entertainment": [{"name": "TOI Entertainment", "url": "https://timesofindia.indiatimes.com/rssfeeds/1081479906.cms"}], 
+    "Health": [{"name": "India Today Health", "url": "https://www.indiatoday.in/health/rss"}]
+}
+
+# Initialize session state for news filters if not present
+if "news_filters" not in st.session_state:
+    st.session_state.news_filters = {
+        "search_term": "",
+        "sort_by": "relevance",
+        "max_items": 20
+    }
+
+# Sidebar with user info and filters
+with st.sidebar:
+    st.markdown(f"### Welcome, {st.session_state.user_name}!")
+    st.divider()
     
-    if st.button("Sign Up"):
-        if not name or not email or not password:
-            st.error("All fields are required!")
-            return False
-        if not is_valid_email(email):
-            st.error("Please enter a valid email address")
-            return False
-        if password != confirm_password:
-            st.error("Passwords do not match!")
-            return False
-        
-        conn = create_connection()
-        c = conn.cursor()
-        
+    st.header("🔍 News Filters")
+    
+    # Search filter
+    st.session_state.news_filters["search_term"] = st.text_input(
+        "Search in headlines", 
+        value=st.session_state.news_filters.get("search_term", "")
+    )
+    
+    # Sort options
+    st.session_state.news_filters["sort_by"] = st.radio(
+        "Sort by",
+        ["relevance", "newest"],
+        index=0 if st.session_state.news_filters.get("sort_by") == "relevance" else 1
+    )
+    
+    # Number of results
+    st.session_state.news_filters["max_items"] = st.slider(
+        "Max results", 
+        min_value=5, 
+        max_value=50, 
+        value=st.session_state.news_filters.get("max_items", 20)
+    )
+    
+    st.divider()
+    logout()
+
+# Main content
+st.title("🗞️ News Results")
+
+# Function to fetch and process RSS feeds
+def fetch_news(feed_list):
+    news_items = []
+    progress_text = "Fetching news from selected sources..."
+    progress_bar = st.progress(0)
+    
+    for i, feed in enumerate(feed_list):
         try:
-            c.execute("INSERT INTO users VALUES (?, ?, ?)", 
-                     (email, hash_password(password), name))
-            conn.commit()
-            st.success("Account created successfully! Please login.")
-            return True
-        except sqlite3.IntegrityError:
-            st.error("Email already exists. Please login instead.")
-            return False
-        finally:
-            conn.close()
+            resp = requests.get(feed["url"], timeout=10)
+            if resp.status_code == 200:
+                data = xmltodict.parse(resp.content)
+                
+                if "rss" in data and "channel" in data["rss"] and "item" in data["rss"]["channel"]:
+                    items = data["rss"]["channel"]["item"]
+                    
+                    # Ensure items is a list
+                    if isinstance(items, dict):
+                        items = [items]
+                    
+                    for item in items:
+                        # Get basic info
+                        title = item.get("title", "No Title")
+                        link = item.get("link", "#")
+                        
+                        # Skip if doesn't match search term
+                        search_term = st.session_state.news_filters["search_term"].lower()
+                        if search_term and search_term not in title.lower():
+                            continue
+                        
+                        # Get additional details
+                        pubDate = item.get("pubDate", "")
+                        description = item.get("description", "No description available")
+                        
+                        # Clean description (remove HTML)
+                        if description and isinstance(description, str):
+                            description = description.split('<')[0]
+                        
+                        # Parse date for sorting
+                        try:
+                            date_obj = datetime.strptime(pubDate, "%a, %d %b %Y %H:%M:%S %z")
+                            timestamp = date_obj.timestamp()
+                        except:
+                            timestamp = 0
+                        
+                        news_items.append({
+                            "title": title,
+                            "link": link,
+                            "pubDate": pubDate,
+                            "description": description,
+                            "source": feed["name"],
+                            "timestamp": timestamp
+                        })
+            
+            # Update progress bar
+            progress_bar.progress((i + 1) / len(feed_list))
+            time.sleep(0.1)  # Small delay for visual feedback
+            
+        except Exception as e:
+            st.warning(f"Failed to load from {feed['name']}: {str(e)}")
+    
+    progress_bar.empty()
+    
+    # Apply sorting
+    if st.session_state.news_filters["sort_by"] == "newest":
+        news_items.sort(key=lambda x: x["timestamp"], reverse=True)
+    
+    return news_items[:st.session_state.news_filters["max_items"]]
 
-# Login function
-def login():
-    st.subheader("Login")
-    email = st.text_input("Email")
-    password = st.text_input("Password", type='password')
+# Check if we have sources selected
+if "selected_sources" not in st.session_state or not st.session_state.selected_sources:
+    st.warning("Please go to the Home page and select news sources.")
     
-    if st.button("Login"):
-        if not email or not password:
-            st.error("Both email and password are required!")
-            return False
-        
-        conn = create_connection()
-        c = conn.cursor()
-        c.execute("SELECT * FROM users WHERE email=? AND password=?", 
-                  (email, hash_password(password)))
-        user = c.fetchone()
-        conn.close()
-        
-        if user:
-            st.session_state.authenticated = True
-            st.session_state.user_email = email
-            st.session_state.user_name = user[2]
-            st.success(f"Welcome back, {user[2]}!")
-            return True
-        else:
-            st.error("Invalid email or password")
-            return False
-    return False
+    if st.button("Go to Home"):
+        st.switch_page("Home.py")
+    st.stop()
 
-# Main auth function
-def show_auth_page():
-    st.set_page_config(page_title="Authentication", layout="centered")
-    st.title("📰 Personalized News Aggregator")
+# Create list of feeds to fetch
+feeds_to_fetch = []
+
+# Add selected sources
+for src in st.session_state.selected_sources:
+    feeds_to_fetch.append({"name": src, "url": sources[src]})
+
+# Add selected category
+if "selected_category" in st.session_state and st.session_state.selected_category in categories:
+    feeds_to_fetch.extend(categories[st.session_state.selected_category])
+
+# Fetch button
+if st.button("🔄 Refresh News"):
+    with st.spinner("Fetching latest news..."):
+        news = fetch_news(feeds_to_fetch)
+        st.session_state.current_news = news
+
+# Display results
+if "current_news" in st.session_state and st.session_state.current_news:
+    news = st.session_state.current_news
     
-    menu = ["Login", "Sign Up"]
-    choice = st.selectbox("Select Option", menu)
+    # Display in a grid layout
+    st.markdown(f"### Found {len(news)} news items")
     
-    if choice == "Login":
-        if login():
-            st.experimental_rerun()
-    else:
-        if sign_up():
-            st.experimental_rerun()
+    # Create columns for the grid
+    col1, col2 = st.columns(2)
+    
+    for i, item in enumerate(news):
+        col = col1 if i % 2 == 0 else col2
+        
+        with col:
+            with st.container():
+                st.markdown(f"### [{item['title']}]({item['link']})")
+                st.caption(f"Source: {item['source']} | {item['pubDate']}")
+                
+                # Show description if available (safely check if None)
+                description = item.get('description')
+                if description:
+                    st.markdown(description[:150] + "..." if len(description) > 150 else description)
+                
+                st.divider()
+else:
+    st.info("Click 'Refresh News' to fetch the latest headlines.")
