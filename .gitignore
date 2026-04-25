@@ -33,6 +33,8 @@ venv/
 ENV/
 env/
 .venv
+.env.example
+node_modules/
 
 # IDEs
 .vscode/
