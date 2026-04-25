@@ -3,11 +3,32 @@ import streamlit as st
 import requests
 import xmltodict
 import json
+import csv
 from datetime import datetime
-from auth_new import show_auth_page, logout, save_preferences
+from config import config
+from auth_new import show_auth_page, logout, save_preferences, restore_session_from_query, add_bookmark, get_bookmarks, delete_bookmark
+from utils import (
+    setup_logger,
+    log_info,
+    log_error,
+    cached,
+    check_rate_limit,
+    clean_html,
+    truncate_text,
+    format_date,
+    is_valid_email,
+    get_time_ago
+)
 
 # Page configuration - MUST BE FIRST Streamlit command
 st.set_page_config(page_title="📰 Personalized News", layout="wide")
+
+# Initialize logger at app startup
+logger = setup_logger(log_level="INFO")
+log_info("News Recommendation System started")
+
+# Restore authentication from query parameters if available
+restore_session_from_query()
 
 # Check authentication
 if "authenticated" not in st.session_state or not st.session_state.authenticated:
@@ -44,8 +65,11 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "news_cache" not in st.session_state:
     st.session_state.news_cache = {}
-if "refresh_news" not in st.session_state:
-    st.session_state.refresh_news = False
+# View and mode control
+if "main_view" not in st.session_state:
+    st.session_state.main_view = "📊 News Dashboard"
+if "show_only_category" not in st.session_state:
+    st.session_state.show_only_category = False
 
 # Sidebar with user info and preferences
 with st.sidebar:
@@ -78,28 +102,92 @@ with st.sidebar:
         st.success("Preferences saved!")
 
     st.divider()
+
+    # Search functionality
+    st.header("🔍 Search News")
+    search_query = st.text_input(
+        "Search headlines", placeholder="Enter keyword...")
+    if search_query:
+        if "news_items" in st.session_state and st.session_state.news_items:
+            filtered_news = [
+                news for news in st.session_state.news_items
+                if search_query.lower() in news['title'].lower() or
+                search_query.lower() in news.get('description', '').lower()
+            ]
+            if filtered_news:
+                st.success(f"Found {len(filtered_news)} articles")
+                if "filtered_news" not in st.session_state:
+                    st.session_state.filtered_news = []
+                st.session_state.filtered_news = filtered_news
+            else:
+                st.warning("No matching articles found")
+
+    st.divider()
+
+    # Bookmarks section
+    st.header("🔖 My Bookmarks")
+    bookmarks = get_bookmarks(st.session_state.user_email)
+    if bookmarks:
+        st.write(f"Total bookmarks: {len(bookmarks)}")
+        for i, (title, link, source, saved_date) in enumerate(bookmarks[:5]):
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                st.caption(f"📌 [{title[:30]}...](../{link})")
+            with col2:
+                if st.button("❌", key=f"del_bookmark_{i}"):
+                    if delete_bookmark(st.session_state.user_email, title, link):
+                        st.success("Bookmark removed!")
+                        st.rerun()
+    else:
+        st.info("No bookmarks yet")
+
+    st.divider()
+
+    # Export functionality
+    st.header("📤 Export News")
+    if "news_items" in st.session_state and st.session_state.news_items:
+        export_format = st.radio("Choose format", ["JSON", "CSV"])
+        if export_format == "JSON":
+            json_data = json.dumps(st.session_state.news_items, indent=2)
+            st.download_button(
+                label="📥 Download as JSON",
+                data=json_data,
+                file_name=f"news_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json"
+            )
+        else:
+            csv_rows = [["Title", "Link", "Source", "Date", "Description"]]
+            for news in st.session_state.news_items:
+                csv_rows.append([
+                    news['title'], news['link'], news['source'],
+                    news['pubDate'], news.get('description', '')
+                ])
+            csv_string = "\n".join([",".join(row) for row in csv_rows])
+            st.download_button(
+                label="📥 Download as CSV",
+                data=csv_string,
+                file_name=f"news_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
+            )
+
+    st.divider()
     logout()
 
 # Main area
 st.title("📰 Personalized News Hub")
 
-# Fetch news function with caching
-
-
+# Fetch news function with caching - using @cached decorator for performance
+@cached(ttl_seconds=config.RSS_CACHE_DURATION)
 def fetch_rss(url):
-    # Check cache first (with 30-minute expiry)
-    current_time = datetime.now().timestamp()
-    if url in st.session_state.news_cache:
-        cached_time, data = st.session_state.news_cache[url]
-        if current_time - cached_time < 1800:  # 30 minutes
-            return data
-
-    # If not in cache or expired, fetch new data
+    """Fetch RSS feed with caching and error handling"""
     try:
+        log_info(f"Fetching RSS from: {url}")
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-        response = requests.get(url, timeout=10, headers=headers)
+        response = requests.get(
+            url, timeout=config.RSS_TIMEOUT, headers=headers)
         if response.status_code != 200:
+            log_error(f"Failed to fetch {url}: HTTP {response.status_code}")
             return []
 
         data = xmltodict.parse(response.content)
@@ -111,23 +199,21 @@ def fetch_rss(url):
         if isinstance(items, dict):
             items = [items]
 
-        # Cache the result
-        st.session_state.news_cache[url] = (current_time, items)
+        log_info(f"Successfully fetched {len(items)} items from {url}")
         return items
     except Exception as e:
+        log_error(f"Error fetching RSS from {url}: {str(e)}")
         st.error(f"Error fetching news: {str(e)}")
         return []
 
 # Function to get news
-
-
 def get_news():
     st.session_state.news_items = []
 
-    # From selected sources
-    for src in st.session_state.selected_sources:
-        items = fetch_rss(sources[src])
-        for item in items[:5]:
+    # If we're in category-only mode (triggered by Quick Categories), fetch only that category
+    if st.session_state.get("show_only_category", False):
+        items = fetch_rss(categories[st.session_state.selected_category])
+        for item in (items or [])[:10]:
             try:
                 title = item.get("title", "No Title")
                 link = item.get("link", "#")
@@ -135,58 +221,84 @@ def get_news():
                 description = item.get(
                     "description", "No description available")
 
-                # Clean description (remove HTML)
+                # Clean and truncate description using utility functions
                 if description and isinstance(description, str):
-                    description = description.split('<')[0]
+                    description = clean_html(description)
+                    description = truncate_text(description, max_length=200)
 
                 st.session_state.news_items.append({
                     "title": title,
                     "link": link,
-                    "pubDate": pubDate,
+                    "pubDate": format_date(pubDate),
+                    "description": description,
+                    "source": st.session_state.selected_category
+                })
+            except Exception as e:
+                log_error(f"Error processing news item: {str(e)}")
+                continue
+        return
+
+    # Default: combine selected sources and the chosen category
+    for src in st.session_state.selected_sources:
+        items = fetch_rss(sources[src])
+        for item in (items or [])[:5]:
+            try:
+                title = item.get("title", "No Title")
+                link = item.get("link", "#")
+                pubDate = item.get("pubDate", "Unknown Date")
+                description = item.get(
+                    "description", "No description available")
+
+                # Clean and truncate description
+                if description and isinstance(description, str):
+                    description = clean_html(description)
+                    description = truncate_text(description, max_length=200)
+
+                st.session_state.news_items.append({
+                    "title": title,
+                    "link": link,
+                    "pubDate": format_date(pubDate),
                     "description": description,
                     "source": src
                 })
             except Exception as e:
+                log_error(f"Error processing news item: {str(e)}")
                 continue
 
     # From category
     items = fetch_rss(categories[st.session_state.selected_category])
-    for item in items[:5]:
+    for item in (items or [])[:5]:
         try:
             title = item.get("title", "No Title")
             link = item.get("link", "#")
             pubDate = item.get("pubDate", "Unknown Date")
             description = item.get("description", "No description available")
 
-            # Clean description (remove HTML)
+            # Clean and truncate description
             if description and isinstance(description, str):
-                description = description.split('<')[0]
+                description = clean_html(description)
+                description = truncate_text(description, max_length=200)
 
             st.session_state.news_items.append({
                 "title": title,
                 "link": link,
-                "pubDate": pubDate,
+                "pubDate": format_date(pubDate),
                 "description": description,
                 "source": st.session_state.selected_category
             })
         except Exception as e:
+            log_error(f"Error processing news item: {str(e)}")
             continue
 
 
-# Check if we need to refresh news (from category click)
-if st.session_state.refresh_news:
-    get_news()
-    st.session_state.refresh_news = False
-
 # Bot response logic
-
-
 def handle_bot_query(query):
     query = query.lower()
 
     # Check for greetings
     greetings = ["hi", "hello", "hey", "greetings"]
     if any(g in query for g in greetings):
+        log_info(f"User greeting: {query}")
         return "Hello! I'm your news assistant. You can ask me for news about specific categories like sports, politics, technology, or market updates."
 
     # Check for category matches
@@ -197,6 +309,7 @@ def handle_bot_query(query):
             break
 
     if matched_category:
+        log_info(f"Fetching news for category: {matched_category}")
         with st.spinner(f"Fetching {matched_category} news..."):
             items = fetch_rss(categories[matched_category])
             if items:
@@ -204,19 +317,22 @@ def handle_bot_query(query):
                 for i, item in enumerate(items[:5]):
                     if i > 0:
                         response += "\n\n"
-                    response += f"🔗 **[{item.get('title', 'No Title')}]({item.get('link', '#')})**"
+                    title = item.get('title', 'No Title')
+                    link = item.get('link', '#')
+                    response += f"🔗 **[{truncate_text(title, max_length=100)}]({link})**"
                     description = item.get("description", "")
                     if description and isinstance(description, str):
-                        description = description.split('<')[0]
-                        if len(description) > 100:
-                            description = description[:100] + "..."
+                        description = clean_html(description)
+                        description = truncate_text(description, max_length=150)
                         response += f"\n{description}"
                 return response
             else:
+                log_error(f"No news found for category: {matched_category}")
                 return f"Sorry, I couldn't find any {matched_category} news right now. Please try again later."
 
     # Check for commands
     if "help" in query:
+        log_info("User requested help")
         return "I can help you get news from different categories. Try asking for:\n\n" + \
                "- Sports news\n" + \
                "- Politics updates\n" + \
@@ -227,16 +343,25 @@ def handle_bot_query(query):
 
     if "clear" in query and "chat" in query:
         st.session_state.chat_history = []
+        log_info("Chat history cleared")
         return "Chat history cleared!"
 
     # Generic response
+    log_info(f"Generic query: {query}")
     return "I can provide news about specific categories like Sports, Politics, Technology, Market, Entertainment, or Health. What type of news are you interested in?"
 
 
-# Tabs for different views
-tab1, tab2 = st.tabs(["📊 News Dashboard", "💬 News Assistant"])
+# View selector for different views (allows programmatic switching)
+st.session_state.main_view = st.radio(
+    "",
+    ["📊 News Dashboard", "💬 News Assistant"],
+    index=0 if st.session_state.get(
+        "main_view", "📊 News Dashboard") == "📊 News Dashboard" else 1,
+    horizontal=True,
+    key="main_view_radio",
+)
 
-with tab1:
+if st.session_state.get("main_view", "📊 News Dashboard") == "📊 News Dashboard":
     col1, col2 = st.columns([2, 1])
 
     with col1:
@@ -244,6 +369,8 @@ with tab1:
 
         # Get news from selected sources and category
         if st.button("🔄 Refresh News"):
+            # when user manually refreshes, show combined view
+            st.session_state.show_only_category = False
             with st.spinner("Fetching latest news..."):
                 get_news()
 
@@ -269,11 +396,14 @@ with tab1:
         # Create a button for each category
         for cat in categories:
             if st.button(f"📌 {cat}"):
+                # Set selected category, switch to dashboard and show only that category
                 st.session_state.selected_category = cat
-                st.session_state.refresh_news = True
-                st.rerun()
+                st.session_state.show_only_category = True
+                st.session_state.main_view = "📊 News Dashboard"
+                with st.spinner(f"Fetching {cat} news..."):
+                    get_news()
 
-with tab2:
+else:
     st.header("🤖 News Assistant")
     st.markdown(
         "Ask questions about news topics or request specific news categories.")

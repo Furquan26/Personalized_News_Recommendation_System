@@ -1,6 +1,6 @@
-# import streamlit as st
-# import requests
-# import xmltodict
+import streamlit as st
+import requests
+import xmltodict
 
 # # RSS sources
 # sources = {
@@ -35,23 +35,25 @@
 # st.markdown("### 🤖 Ask the News Bot")
 # bot_query = st.text_input("Ask anything e.g., tech news, politics, etc.")
 
-# # News fetching function
-# def fetch_news(feed_urls):
-#     news_items = []
-#     for feed in feed_urls:
-#         try:
-#             response = requests.get(feed["url"])
-#             data = xmltodict.parse(response.content)
-#             items = data["rss"]["channel"]["item"]
-#             for item in items:
-#                 news_items.append({
-#                     "title": item.get("title", "No Title"),
-#                     "link": item.get("link", "#"),
-#                     "source": feed["name"]
-#                 })
-#         except Exception as e:
-#             st.warning(f"Error fetching from {feed['name']}: {e}")
-#     return news_items
+# News fetching function
+
+
+def fetch_news(feed_urls):
+    news_items = []
+    for feed in feed_urls:
+        try:
+            response = requests.get(feed["url"])
+            data = xmltodict.parse(response.content)
+            items = data["rss"]["channel"]["item"]
+            for item in items:
+                news_items.append({
+                    "title": item.get("title", "No Title"),
+                    "link": item.get("link", "#"),
+                    "source": feed["name"]
+                })
+        except Exception as e:
+            st.warning(f"Error fetching from {feed['name']}: {e}")
+    return news_items
 
 # # Display News Button
 # if st.button("Get News") or bot_query:
@@ -81,4 +83,3 @@
 #             st.markdown(f"- [{item['title']}]({item['link']}) _(Source: {item['source']})_")
 #     else:
 #         st.info("No news found for the selected options.")
-
